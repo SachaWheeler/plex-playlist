@@ -3,17 +3,22 @@
 Create a Plex playlist from tracks that Plex says are sonically similar
 to a reference track already in the library.
 
+The reference track can be specified in three ways:
+  1. --reference-mp3 PATH   -> title/artist are read from the file's ID3 tags
+  2. --reference-title / --reference-artist
+  3. --reference-key (Plex ratingKey)
+
 Requirements:
 - Plex server running
 - PlexAPI installed
+- mutagen installed (for ID3 tag reading): pip install mutagen
 - Music library section called "Music" (or change section name below)
 - Reference track already exists in Plex
 - Sonic Analysis enabled/completed for that reference track
 
 Example:
     python create_playlist.py \
-      --reference-title "Teardrop" \
-      --reference-artist "Massive Attack" \
+      --reference-mp3 "/home/sacha/Music/Massive Attack/Teardrop.mp3" \
       --playlist-name "Similar to Teardrop" \
       --max-results 50
 """
@@ -21,7 +26,7 @@ Example:
 import os
 import sys
 import argparse
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 try:
     from plexapi.server import PlexServer
@@ -34,6 +39,62 @@ try:
 except ImportError:
     os.system("pip install PlexAPI")
     from plexapi.playlist import Playlist
+
+try:
+    from mutagen import File as MutagenFile
+    from mutagen.id3 import ID3
+except ImportError:
+    os.system("pip install mutagen")
+    from mutagen import File as MutagenFile
+    from mutagen.id3 import ID3
+
+
+def read_id3_title_artist(mp3_path: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Read the title and artist from an MP3's ID3v2 tags.
+
+    Handles both plain ID3 tags (TIT2/TPE1) and EasyID3-style access,
+    falling back gracefully if tags are missing or malformed.
+
+    Args:
+        mp3_path: Path to the MP3 file.
+
+    Returns:
+        Tuple of (title, artist). Either may be None if not present.
+    """
+    if not os.path.exists(mp3_path):
+        raise FileNotFoundError(f"MP3 file not found: {mp3_path}")
+
+    title = None
+    artist = None
+
+    # First try the generic mutagen File loader, which is format-agnostic
+    # and works for most easy-access tag frames.
+    try:
+        audio = MutagenFile(mp3_path, easy=True)
+        if audio is not None and audio.tags is not None:
+            title_list = audio.tags.get("title")
+            artist_list = audio.tags.get("artist")
+            if title_list:
+                title = title_list[0]
+            if artist_list:
+                artist = artist_list[0]
+    except Exception:
+        pass
+
+    # Fall back to raw ID3 frames (TIT2 = title, TPE1 = artist) if the
+    # easy loader didn't find anything, e.g. non-standard tag versions.
+    if title is None or artist is None:
+        try:
+            id3 = ID3(mp3_path)
+            if title is None and "TIT2" in id3:
+                title = str(id3["TIT2"].text[0])
+            if artist is None and "TPE1" in id3:
+                artist = str(id3["TPE1"].text[0])
+        except Exception:
+            pass
+
+    return title, artist
 
 
 class PlexSimilarPlaylist:
@@ -103,9 +164,7 @@ class PlexSimilarPlaylist:
             reference = self.find_track_by_rating_key(rating_key)
         else:
             if not title:
-                raise ValueError(
-                    "Either --reference-title or --reference-key is required"
-                )
+                raise ValueError("Either a title or a rating key is required")
             reference = self.find_track_by_title(title=title, artist=artist)
 
         if not getattr(reference, "hasSonicAnalysis", False):
@@ -115,6 +174,11 @@ class PlexSimilarPlaylist:
                 f"{reference.title}. "
                 "Check your Plex Music library analysis settings."
             )
+
+        print(
+            f"Reference track found in Plex: "
+            f"{getattr(reference, 'grandparentTitle', 'Unknown')} - {reference.title}"
+        )
 
         try:
             similar = reference.sonicallySimilar(limit=max_results)
@@ -126,6 +190,26 @@ class PlexSimilarPlaylist:
 
         results: List[Dict] = []
         seen_ratings = set()
+        seen_tracks = set()
+
+        artist = (
+            getattr(reference, "originalTitle", None)
+            or getattr(reference, "grandparentTitle", None)
+            or "Unknown"
+        )
+        results.append(
+            {
+                "key": reference.key,
+                "title": reference.title,
+                "artist": artist,
+                "album": getattr(reference, "parentTitle", None) or "Unknown",
+                "rating_key": getattr(reference, "ratingKey", None),
+                "object": reference,
+                "distance": 0.0,
+            }
+        )
+        seen_ratings.add(getattr(reference, "ratingKey", None))
+        seen_tracks.add((artist.casefold(), reference.title.casefold()))
 
         for track in similar:
             track_rating_key = getattr(track, "ratingKey", None)
@@ -137,13 +221,20 @@ class PlexSimilarPlaylist:
                 continue
             seen_ratings.add(track_rating_key)
 
+            artist_name = (
+                getattr(track, "originalTitle", None)
+                or getattr(track, "grandparentTitle", None)
+                or "Unknown"
+            )
+            if (artist_name.casefold(), track.title.casefold()) in seen_tracks:
+                continue
+
+            seen_tracks.add((artist_name.casefold(), track.title.casefold()))
             results.append(
                 {
                     "key": track.key,
                     "title": track.title,
-                    "artist": getattr(track, "originalTitle", None)
-                    or getattr(track, "grandparentTitle", None)
-                    or "Unknown",
+                    "artist": artist_name,
                     "album": getattr(track, "parentTitle", None) or "Unknown",
                     "rating_key": track_rating_key,
                     "object": track,
@@ -160,9 +251,6 @@ class PlexSimilarPlaylist:
         if not similar_tracks:
             print("No similar tracks found.")
             return False
-
-        # sort by distance if available
-        similar_tracks.sort(key=lambda x: x.get("distance", float("inf")))
 
         track_objects = [item["object"] for item in similar_tracks]
         try:
@@ -196,6 +284,10 @@ def main():
         help="Plex API token (or set PLEX_TOKEN env var)",
     )
     parser.add_argument(
+        "--reference-mp3",
+        help="Path to a local MP3 file; title/artist are read from its ID3v2 tags",
+    )
+    parser.add_argument(
         "--reference-title", help="Title of the reference track in Plex"
     )
     parser.add_argument(
@@ -205,10 +297,12 @@ def main():
     parser.add_argument(
         "--reference-key",
         type=int,
-        help="Plex ratingKey of the reference track (alternative to title/artist)",
+        help="Plex ratingKey of the reference track (alternative to title/artist/mp3)",
     )
     parser.add_argument(
-        "--playlist-name", default=None, help="Name for the playlist to create"
+        "--playlist-name",
+        default=None,
+        help="Name for the playlist to create",
     )
     parser.add_argument(
         "--max-results",
@@ -231,8 +325,39 @@ def main():
         )
         sys.exit(1)
 
-    if args.reference_key is None and not args.reference_title:
-        print("Error: provide --reference-title or --reference-key", file=sys.stderr)
+    # Resolve reference identification: mp3 tags take priority if both
+    # --reference-mp3 and --reference-title/--reference-artist are passed,
+    # but explicit title/artist values override tags read from the file.
+    reference_title = args.reference_title
+    reference_artist = args.reference_artist
+
+    if args.reference_mp3:
+        try:
+            tag_title, tag_artist = read_id3_title_artist(args.reference_mp3)
+        except FileNotFoundError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        if not tag_title and not tag_artist:
+            print(
+                f"Error: could not read title/artist ID3 tags from '{args.reference_mp3}'. "
+                "Pass --reference-title/--reference-artist explicitly instead.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        reference_title = reference_title or tag_title
+        reference_artist = reference_artist or tag_artist
+
+        print(
+            f"Read from ID3 tags: title='{reference_title}', artist='{reference_artist}'"
+        )
+
+    if args.reference_key is None and not reference_title:
+        print(
+            "Error: provide --reference-mp3, --reference-title, or --reference-key",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     try:
@@ -243,14 +368,14 @@ def main():
         )
 
         similar_tracks = plex_playlist.find_similar_tracks(
-            title=args.reference_title,
-            artist=args.reference_artist,
+            title=reference_title,
+            artist=reference_artist,
             rating_key=args.reference_key,
             max_results=args.max_results,
         )
 
         if similar_tracks:
-            playlist_name = args.playlist_name or f"Similar to {args.reference_title}"
+            playlist_name = args.playlist_name or f"Similar to {reference_title}"
             plex_playlist.create_playlist(similar_tracks, playlist_name)
         else:
             print("No sonically similar tracks found.")
