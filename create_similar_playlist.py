@@ -254,6 +254,17 @@ class PlexSimilarPlaylist:
 
         track_objects = [item["object"] for item in similar_tracks]
         try:
+            # if a playlist with the same name already exists, it will be replaced.
+            playlist_exists = any(
+                pl.title == playlist_name for pl in self.plex.playlists()
+            )
+            if playlist_exists:
+                print(f"Playlist '{playlist_name}' already exists. Replacing it.")
+                existing_playlist = next(
+                    pl for pl in self.plex.playlists() if pl.title == playlist_name
+                )
+                existing_playlist.delete()
+
             # This is the version-safe PlexAPI pattern.
             Playlist.create(self.plex, title=playlist_name, items=track_objects)
         except Exception as exc:
