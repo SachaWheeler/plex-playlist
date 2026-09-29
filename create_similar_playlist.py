@@ -213,11 +213,11 @@ class PlexSimilarPlaylist:
 
         for track in similar:
             track_rating_key = getattr(track, "ratingKey", None)
-            if track_rating_key is None:
-                continue
-            if track_rating_key == getattr(reference, "ratingKey", None):
-                continue
-            if track_rating_key in seen_ratings:
+            if (
+                track_rating_key is None
+                or track_rating_key == getattr(reference, "ratingKey", None)
+                or track_rating_key in seen_ratings
+            ):
                 continue
             seen_ratings.add(track_rating_key)
 
@@ -265,7 +265,6 @@ class PlexSimilarPlaylist:
                 )
                 existing_playlist.delete()
 
-            # This is the version-safe PlexAPI pattern.
             Playlist.create(self.plex, title=playlist_name, items=track_objects)
         except Exception as exc:
             raise RuntimeError(
